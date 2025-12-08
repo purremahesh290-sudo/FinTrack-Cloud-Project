@@ -1,15 +1,16 @@
 // server.js
-// FinTrack backend (local-file CSV upload variant - Option B)
+// FinTrack backend (local-file CSV upload variant - flexible header mapping)
 //
 // Features:
 // - Express API for auth, transactions, uploads
 // - CSV uploads saved to local /tmp/uploads (ephemeral) and enqueued as jobs
 // - Worker loop picks up parse_csv and rescore_all jobs
-// - Uses multer memory storage so req.file.buffer is available
+// - CSV parser normalises headers and accepts common synonyms for amount, merchant, country, timestamp
+// - Multer memory storage used so req.file.buffer is available
 // - Serves frontend from ./frontend if present
 //
-// WARNING: Uploaded files are stored on the instance ephemeral storage (/tmp/uploads).
-// If the EB instance is replaced, files are lost. This is intended for quick testing/dev.
+// WARNING: Uploaded files are stored on instance ephemeral storage (/tmp/uploads).
+// If the EB instance is replaced, files are lost. Good for testing/demo.
 
 require('dotenv').config();
 
@@ -32,7 +33,7 @@ fs.mkdirSync(UPLOAD_DIR, { recursive: true, mode: 0o700 });
 const app = express();
 app.use(express.json());
 
-// multer memory storage
+// multer memory storage (keeps file in req.file.buffer)
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
 const estimator = new RiskEstimator();
@@ -40,14 +41,16 @@ const estimator = new RiskEstimator();
 // ---------- helpers ----------
 function safeParseNumber(v) {
   if (v === null || v === undefined) return 0;
-  const s = String(v).replace(/[^0-9.-]+/g, '');
+  // remove currency symbols and thousands separators, keep - and .
+  const s = String(v).replace(/[^0-9\.\-]+/g, '');
   const n = Number(s);
   return Number.isFinite(n) ? n : 0;
 }
 
 function isLikelyUserId(id) {
   if (!id || typeof id !== 'string') return false;
-  return /^[A-Za-z0-9\-_]{8,}$/.test(id);
+  // simple UUID-ish check (loose)
+  return /^[0-9a-fA-F\-]{8,}$/i.test(id);
 }
 
 // ---------- DB tables init ----------
@@ -228,17 +231,71 @@ async function processParseCsvJob(job) {
       return;
     }
 
-    const rs = fs.createReadStream(local_path).pipe(csv({ mapHeaders: ({ header }) => header.trim() }));
+    const rs = fs.createReadStream(local_path).pipe(csv({ mapHeaders: ({ header }) => header }));
     let inserted = 0;
 
-    for await (const row of rs) {
+    // Flexible header mapping loop:
+    for await (const rowRaw of rs) {
       try {
+        // Normalize keys: trim + lowercase
+        const row = {};
+        for (const [k, v] of Object.entries(rowRaw || {})) {
+          const nk = String(k || '').trim().toLowerCase();
+          row[nk] = v;
+        }
+
+        // amount candidates
+        const amountCandidates = [
+          'amount', 'amt', 'value', 'amount (eur)', 'amount_eur',
+          'transaction_amount', 'debit', 'credit', 'money', 'amount_euro', 'price'
+        ];
+        let rawAmount = 0;
+        for (const c of amountCandidates) {
+          if (row[c] !== undefined && String(row[c]).trim() !== '') {
+            rawAmount = row[c];
+            break;
+          }
+        }
+        const amount = safeParseNumber(rawAmount);
+
+        // merchant candidates
+        const merchantCandidates = ['merchant', 'shop', 'payee', 'description', 'vendor', 'store', 'narrative'];
+        let merchant = 'unknown';
+        for (const c of merchantCandidates) {
+          if (row[c] !== undefined && String(row[c]).trim() !== '') {
+            merchant = String(row[c]).trim();
+            break;
+          }
+        }
+
+        // country candidates
+        const countryCandidates = ['country', 'country_code', 'location', 'countryname'];
+        let country = 'Ireland';
+        for (const c of countryCandidates) {
+          if (row[c] !== undefined && String(row[c]).trim() !== '') {
+            country = String(row[c]).trim();
+            break;
+          }
+        }
+
+        // date / timestamp candidates
+        const dateCandidates = ['timestamp', 'date', 'datetime', 'transaction_date', 'posted_date', 'created_at'];
+        let timestamp = new Date().toISOString();
+        for (const c of dateCandidates) {
+          if (row[c] !== undefined && String(row[c]).trim() !== '') {
+            const s = String(row[c]).trim();
+            const parsed = new Date(s);
+            timestamp = isNaN(parsed.getTime()) ? s : parsed.toISOString();
+            break;
+          }
+        }
+
         const tx = {
           user_id,
-          amount: safeParseNumber(row.amount ?? row.Amount ?? 0),
-          country: row.country ?? row.Country ?? 'Ireland',
-          merchant: row.merchant ?? row.Merchant ?? 'unknown',
-          timestamp: row.timestamp ?? row.Timestamp ?? new Date().toISOString()
+          amount,
+          country,
+          merchant,
+          timestamp
         };
 
         const id = uuidv4();
