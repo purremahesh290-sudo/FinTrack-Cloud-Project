@@ -1,0 +1,8 @@
+{
+  "name": "fintrack-risk-lib",
+  "version": "1.0.0",
+  "description": "Custom risk scoring library for FinTrack",
+  "main": "index.js",
+  "author": "Mahesh Purre",
+  "license": "MIT"
+}
