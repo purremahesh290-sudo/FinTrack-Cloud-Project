@@ -1,341 +1,177 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>FinTrack — Personal Finance Dashboard</title>
-
-  <!-- Bootstrap 5 (cdn) -->
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
-
-  <!-- Chart.js -->
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-
-  <style>
-    body { background:#f8fafc; }
-    header { background: linear-gradient(90deg,#0d6efd22,#0dcaf022); border-bottom: 1px solid rgba(13,110,253,0.06); }
-    .page-title { font-weight:700; letter-spacing: -0.5px; }
-    .card { box-shadow: 0 6px 18px rgba(22,28,45,0.06); }
-    .small-muted { font-size:0.85rem; color:#6b7280; }
-    #transactionsTable pre { white-space: pre-wrap; word-wrap: break-word; }
-  </style>
+<meta charset="utf-8" />
+<title>FinTrack Dashboard</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f6f7fb;}
+  .card { background: white; padding: 20px; border-radius: 12px; margin-bottom: 20px; }
+  button { padding: 8px 14px; border-radius: 6px; background:#0b76ef; color:white; border:0; cursor:pointer; }
+  input, select { padding:8px; border-radius:6px; border:1px solid #ccc; width:100%; }
+</style>
 </head>
+
 <body>
-  <header class="py-3 mb-4">
-    <div class="container d-flex align-items-center justify-content-between">
-      <div>
-        <h1 class="h3 page-title mb-0">FinTrack</h1>
-        <div class="small-muted">Personal finance tracker — upload transactions, view analytics & risk scores</div>
-      </div>
-      <div>
-        <span id="currentUserLabel" class="me-2 small-muted">Not signed in</span>
-      </div>
-    </div>
-  </header>
+<h2>FinTrack Dashboard</h2>
 
-  <main class="container mb-5">
-    <div class="row g-4">
+<div class="card">
+  <h3>Sign In</h3>
+  <input id="email" placeholder="Enter email" />
+  <button id="btnSignIn">Sign In</button>
+  <p id="loginStatus"></p>
+  <hr>
+  <label>Your User ID:</label>
+  <input id="userIdFetch" readonly />
+</div>
 
-      <!-- Left: Controls -->
-      <div class="col-lg-4">
-        <div class="card p-3 mb-3">
-          <h5 class="mb-3">Account</h5>
-          <div class="mb-2">
-            <label class="form-label small">Email</label>
-            <input id="emailInput" class="form-control" placeholder="you@example.com" />
-          </div>
-          <div class="d-flex gap-2">
-            <button id="btnRegister" class="btn btn-primary w-100">Register / Sign in</button>
-            <button id="btnSignOut" class="btn btn-outline-secondary d-none">Sign out</button>
-          </div>
-        </div>
+<div class="card">
+  <h3>Upload CSV</h3>
+  <input type="file" id="csvFile" accept=".csv" />
+  <button id="btnUploadCsv">Upload</button>
+  <p id="uploadResult"></p>
+</div>
 
-        <div class="card p-3 mb-3">
-          <h5 class="mb-3">Add Transaction</h5>
-          <div class="mb-2"><input id="txAmount" class="form-control" placeholder="Amount (e.g. 24.50)" /></div>
-          <div class="mb-2"><input id="txCountry" class="form-control" placeholder="Country (e.g. Ireland)" value="Ireland" /></div>
-          <div class="mb-2"><input id="txMerchant" class="form-control" placeholder="Merchant (e.g. Tesco)" /></div>
-          <div class="mb-2"><input id="txTimestamp" class="form-control" placeholder="Timestamp (optional ISO)" /></div>
-          <div class="d-grid"><button id="btnAddTx" class="btn btn-success">Add Transaction</button></div>
-          <div id="addTxResult" class="mt-2 small-muted"></div>
-        </div>
+<div class="card">
+  <h3>Add Transaction</h3>
+  <input id="tAmount" placeholder="Amount" />
+  <input id="tCountry" placeholder="Country (optional)" />
+  <input id="tMerchant" placeholder="Merchant (optional)" />
+  <button id="btnAddTx">Add</button>
+  <p id="txResult"></p>
+</div>
 
-        <div class="card p-3">
-          <h5 class="mb-3">Upload CSV</h5>
-          <div class="mb-2"><input type="file" id="csvFile" class="form-control" accept=".csv" /></div>
-          <div class="mb-2"><button id="btnUploadCsv" class="btn btn-outline-primary w-100">Upload CSV</button></div>
-          <div class="small-muted mt-2">CSV must have headers: <code>amount,country,merchant,timestamp</code></div>
-          <div id="uploadResult" class="mt-2 small-muted"></div>
-        </div>
-      </div>
+<div class="card">
+  <h3>Last 30 Transactions</h3>
+  <button id="btnRefresh">Refresh</button>
+  <div id="txList"></div>
+</div>
 
-      <!-- Right: Dashboard -->
-      <div class="col-lg-8">
-        <div class="card p-3 mb-3">
-          <div class="d-flex align-items-center justify-content-between mb-2">
-            <h5 class="mb-0">Dashboard</h5>
-            <div>
-              <button id="btnRefresh" class="btn btn-sm btn-outline-secondary">Refresh</button>
-              <button id="btnRescore" class="btn btn-sm btn-outline-warning">Re-run Risk Scoring</button>
-            </div>
-          </div>
+<script>
+const API_BASE = "http://fintrack-web.eba-dfun6p2q.eu-west-1.elasticbeanstalk.com/api";
 
-          <div class="row gy-3">
-            <div class="col-md-6">
-              <div class="small-muted">Total Transactions</div>
-              <div id="totalCount" class="h4">0</div>
-            </div>
-            <div class="col-md-6">
-              <div class="small-muted">Total Spend</div>
-              <div id="totalSpend" class="h4">€0.00</div>
-            </div>
+let currentUser = null;
+const email = document.getElementById('email');
+const btnSignIn = document.getElementById('btnSignIn');
+const loginStatus = document.getElementById('loginStatus');
+const userIdFetch = document.getElementById('userIdFetch');
 
-            <div class="col-12">
-              <canvas id="spendChart" height="120"></canvas>
-            </div>
-          </div>
-        </div>
+const csvFile = document.getElementById('csvFile');
+const btnUploadCsv = document.getElementById('btnUploadCsv');
+const uploadResult = document.getElementById('uploadResult');
 
-        <div id="transactionsCard" class="card p-3">
-          <div class="d-flex align-items-center justify-content-between mb-2">
-            <h5 class="mb-0">Transactions</h5>
-            <div class="input-group input-group-sm w-auto">
-              <input id="userIdFetch" class="form-control form-control-sm" placeholder="User ID" />
-              <button id="btnList" class="btn btn-sm btn-primary">List</button>
-            </div>
-          </div>
+const btnAddTx = document.getElementById('btnAddTx');
+const tAmount = document.getElementById('tAmount');
+const tCountry = document.getElementById('tCountry');
+const tMerchant = document.getElementById('tMerchant');
+const txResult = document.getElementById('txResult');
 
-          <div class="table-responsive">
-            <table id="transactionsTable" class="table table-hover align-middle">
-              <thead>
-                <tr>
-                  <th>When</th><th>Amount</th><th>Merchant</th><th>Country</th><th>Risk</th>
-                </tr>
-              </thead>
-              <tbody></tbody>
-            </table>
-          </div>
+const btnRefresh = document.getElementById('btnRefresh');
+const txList = document.getElementById('txList');
 
-          <div id="noTransactionsText" class="text-muted small">No transactions yet. Use the controls to add or upload.</div>
-        </div>
-      </div>
+btnSignIn.addEventListener('click', async () => {
+  const e = email.value.trim();
+  if (!e) return alert("Enter email");
 
-    </div>
-  </main>
-
-  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
-
-  <script>
-  const API_BASE = window.location.origin + '/api';
-  const emailInput = document.getElementById('emailInput');
-  const btnRegister = document.getElementById('btnRegister');
-  const btnSignOut = document.getElementById('btnSignOut');
-  const currentUserLabel = document.getElementById('currentUserLabel');
-  const txAmount = document.getElementById('txAmount');
-  const txCountry = document.getElementById('txCountry');
-  const txMerchant = document.getElementById('txMerchant');
-  const txTimestamp = document.getElementById('txTimestamp');
-  const btnAddTx = document.getElementById('btnAddTx');
-  const addTxResult = document.getElementById('addTxResult');
-  const csvFile = document.getElementById('csvFile');
-  const btnUploadCsv = document.getElementById('btnUploadCsv');
-  const uploadResult = document.getElementById('uploadResult');
-  const btnRefresh = document.getElementById('btnRefresh');
-  const btnRescore = document.getElementById('btnRescore');
-  const userIdFetch = document.getElementById('userIdFetch');
-  const btnList = document.getElementById('btnList');
-  const totalCount = document.getElementById('totalCount');
-  const totalSpend = document.getElementById('totalSpend');
-  const transactionsTbody = document.querySelector('#transactionsTable tbody');
-  const noTransactionsText = document.getElementById('noTransactionsText');
-  let currentUser = null;
-  let spendChart = null;
-
-  function setUser(user) {
-    currentUser = user;
-    if (user) {
-      currentUserLabel.textContent = user.email;
-      userIdFetch.value = user.id;
-      btnSignOut.classList.remove('d-none');
-      btnRegister.textContent = 'Refresh Sign-in';
-    } else {
-      currentUserLabel.textContent = 'Not signed in';
-      btnSignOut.classList.add('d-none');
-      btnRegister.textContent = 'Register / Sign in';
-    }
-  }
-
-  async function apiFetch(path, opts = {}) {
-    const res = await fetch(API_BASE + path, opts);
-    if (!res.ok) {
-      const err = await res.json().catch(()=>({error:'unknown'}));
-      throw new Error(err.error || res.statusText);
-    }
-    return res.json();
-  }
-
-  btnRegister.addEventListener('click', async () => {
-    const email = (emailInput.value || '').trim();
-    if (!email) return alert('Enter an email to register/sign in');
-    btnRegister.disabled = true;
-    try {
-      const result = await apiFetch('/auth/echo', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ email }) });
-      setUser(result);
-      alert('Signed in as: ' + result.email);
-    } catch(e) {
-      alert('Sign in error: ' + e.message);
-    } finally { btnRegister.disabled = false; }
+  const r = await fetch(API_BASE + "/auth/echo", {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({ email:e })
   });
+  const j = await r.json();
+  currentUser = j;
+  userIdFetch.value = j.id;
+  loginStatus.textContent = "Signed in: " + j.email;
+});
 
-  btnSignOut.addEventListener('click', () => setUser(null));
+// ---------- CSV VALIDATION + UPLOAD ----------
+btnUploadCsv.addEventListener('click', async () => {
+  if (!currentUser && !userIdFetch.value)
+    return alert("Sign in or paste your user id first.");
 
-  btnAddTx.addEventListener('click', async () => {
-    if (!currentUser && !userIdFetch.value) return alert('Sign in or paste your user id first.');
-    const payload = {
-      user_id: currentUser ? currentUser.id : userIdFetch.value.trim(),
-      amount: txAmount.value || 0,
-      country: txCountry.value || 'Ireland',
-      merchant: txMerchant.value || 'Unknown',
-      timestamp: txTimestamp.value || new Date().toISOString()
-    };
-    btnAddTx.disabled = true;
-    try {
-      const r = await apiFetch('/transactions', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(payload) });
-      addTxResult.textContent = 'Transaction added — risk score: ' + r.risk_score;
-      await refreshDashboard(payload.user_id);
-    } catch(e) {
-      addTxResult.textContent = 'Error: ' + e.message;
-    } finally {
-      btnAddTx.disabled = false;
-      setTimeout(()=> addTxResult.textContent = '', 5000);
-    }
+  const f = csvFile.files[0];
+  if (!f) return alert("Choose a CSV file first.");
+
+  // Validate CSV
+  const text = await f.slice(0, 10000).text();
+  const firstLine = text.split(/\r?\n/).find(l => l.trim() !== "");
+  if (!firstLine) return alert("CSV looks empty");
+
+  const normalize = h => String(h).replace(/^\uFEFF/,"")
+    .replace(/[()\[\]"]/g,"")
+    .replace(/[^\w\s\-]/g," ")
+    .replace(/\s+/g," ")
+    .trim().toLowerCase();
+
+  const headers = firstLine.split(",").map(h => normalize(h));
+
+  const has = (tokens) => headers.some(h => tokens.some(t => h.includes(t)));
+
+  const amountTokens = ["amount","amt","value","transaction_amount","monthly_expense_total"];
+  const dateTokens = ["timestamp","date","datetime","transaction_date"];
+  const merchantTokens = ["merchant","shop","vendor","store","description"];
+
+  if (!has(amountTokens)) {
+    return alert("CSV missing amount column");
+  }
+  if (!has(dateTokens)) {
+    return alert("CSV missing date/timestamp column");
+  }
+
+  const fd = new FormData();
+  fd.append("file", f);
+  fd.append("user_id", currentUser ? currentUser.id : userIdFetch.value);
+
+  uploadResult.textContent = "Uploading...";
+  btnUploadCsv.disabled = true;
+
+  try {
+    const r = await fetch(API_BASE + "/transactions/upload", { method:"POST", body:fd });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error);
+    uploadResult.textContent = "Uploaded. Job: " + j.job_id;
+    setTimeout(()=> btnRefresh.click(), 2000);
+  } catch(err) {
+    uploadResult.textContent = "Upload failed: " + err.message;
+  }
+
+  btnUploadCsv.disabled = false;
+  csvFile.value = "";
+});
+
+// ---------- ADD TX ----------
+btnAddTx.addEventListener("click", async () => {
+  const user_id = currentUser ? currentUser.id : userIdFetch.value.trim();
+  const amount = tAmount.value;
+  if (!user_id || !amount) return alert("Missing fields");
+
+  const r = await fetch(API_BASE+"/transactions",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({
+      user_id,
+      amount,
+      country:tCountry.value,
+      merchant:tMerchant.value
+    })
   });
+  const j = await r.json();
+  txResult.textContent = "Risk score: "+j.risk_score;
+});
 
-  btnUploadCsv.addEventListener('click', async () => {
-    if (!currentUser && !userIdFetch.value) return alert('Sign in or paste your user id first.');
-    const f = csvFile.files[0];
-    if (!f) return alert('Choose a CSV file first.');
-    const fd = new FormData();
-    fd.append('file', f);
-    fd.append('user_id', currentUser ? currentUser.id : userIdFetch.value.trim());
-    btnUploadCsv.disabled = true;
-    uploadResult.textContent = 'Uploading...';
-    try {
-      const res = await fetch(API_BASE + '/transactions/upload', { method:'POST', body: fd });
-      const j = await res.json();
-      if (!res.ok) throw new Error(j.error || JSON.stringify(j));
-      uploadResult.textContent = 'Upload accepted. Job: ' + (j.job_id || j.uploaded || 'n/a');
-      setTimeout(()=> refreshDashboard(fd.get('user_id')), 2500);
-    } catch(e) {
-      uploadResult.textContent = 'Upload failed: ' + e.message;
-    } finally {
-      btnUploadCsv.disabled = false;
-      setTimeout(()=> uploadResult.textContent = '', 6000);
-      csvFile.value = '';
-    }
-  });
+// ---------- REFRESH ----------
+btnRefresh.addEventListener("click", async () => {
+  const user_id = currentUser ? currentUser.id : userIdFetch.value.trim();
+  if (!user_id) return alert("Sign in first.");
 
-  btnList.addEventListener('click', async () => {
-    const uid = (userIdFetch.value || '').trim();
-    if (!uid) return alert('Enter a user id to fetch transactions.');
-    await refreshDashboard(uid, true);
-  });
+  const r = await fetch(API_BASE+"/transactions?user_id="+user_id);
+  const j = await r.json();
 
-  btnRescore.addEventListener('click', async () => {
-    const uid = (currentUser ? currentUser.id : (userIdFetch.value || '').trim());
-    if (!uid) return alert('Sign in or enter user id to rescore.');
-    if (!confirm('Recalculate risk scores for all transactions for this user?')) return;
-    btnRescore.disabled = true;
-    try {
-      await apiFetch('/rescore', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ user_id: uid }) });
-      alert('Rescore job queued. Refreshing in 3s.');
-      setTimeout(()=> refreshDashboard(uid, true), 3000);
-    } catch(e) {
-      alert('Rescore error: ' + e.message);
-    } finally { btnRescore.disabled = false; }
-  });
+  txList.innerHTML = j.map(t =>
+    `<div>€${t.amount} - ${t.merchant} (${t.risk_score})</div>`
+  ).join("");
+});
+</script>
 
-  async function refreshDashboard(userIdOverride, forceFetch=false) {
-    const uid = userIdOverride || (currentUser ? currentUser.id : (userIdFetch.value || '').trim());
-    if (!uid) return;
-    btnRefresh.disabled = true;
-    try {
-      const txs = await apiFetch('/transactions?user_id=' + encodeURIComponent(uid));
-      renderTransactions(txs);
-      const total = txs.reduce((s,t)=> s + Number(t.amount||0), 0);
-      totalCount.textContent = txs.length;
-      totalSpend.textContent = '€' + (Math.round(total*100)/100).toFixed(2);
-      renderChart(txs);
-    } catch(e) {
-      console.error(e);
-      alert('Failed to refresh: ' + e.message);
-    } finally {
-      btnRefresh.disabled = false;
-    }
-  }
-
-  function renderTransactions(txs) {
-    transactionsTbody.innerHTML = '';
-    if (!txs || txs.length === 0) {
-      noTransactionsText.classList.remove('d-none');
-      document.getElementById('transactionsTable').classList.add('d-none');
-      return;
-    }
-    noTransactionsText.classList.add('d-none');
-    document.getElementById('transactionsTable').classList.remove('d-none');
-
-    for (const t of txs) {
-      const tr = document.createElement('tr');
-      const when = new Date(t.timestamp || t.created_at || Date.now()).toLocaleString();
-      tr.innerHTML = `
-        <td>${when}</td>
-        <td>€${(Number(t.amount||0)).toFixed(2)}</td>
-        <td>${escapeHtml(t.merchant||'')}</td>
-        <td>${escapeHtml(t.country||'')}</td>
-        <td><span class="badge ${badgeForRisk(t.risk_score)}">${t.risk_score ?? '0'}</span></td>
-      `;
-      transactionsTbody.appendChild(tr);
-    }
-  }
-
-  function badgeForRisk(score) {
-    if (score >= 70) return 'bg-danger';
-    if (score >= 40) return 'bg-warning text-dark';
-    return 'bg-success';
-  }
-
-  function escapeHtml(s) {
-    return String(s || '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
-  }
-
-  function renderChart(txs) {
-    const byMonth = {};
-    for (const t of txs) {
-      const m = (new Date(t.timestamp || t.created_at)).toISOString().slice(0,7);
-      byMonth[m] = (byMonth[m] || 0) + Number(t.amount || 0);
-    }
-    const labels = Object.keys(byMonth).sort();
-    const data = labels.map(l => byMonth[l].toFixed(2));
-    if (!spendChart) {
-      const ctx = document.getElementById('spendChart');
-      spendChart = new Chart(ctx, {
-        type: 'bar',
-        data: { labels, datasets: [{ label: 'Spend (€)', data, tension:0.3 }] },
-        options: { responsive:true, plugins:{legend:{display:false}} }
-      });
-    } else {
-      spendChart.data.labels = labels;
-      spendChart.data.datasets[0].data = data;
-      spendChart.update();
-    }
-  }
-
-  (function init() {
-    setUser(null);
-    if (userIdFetch.value) {
-      refreshDashboard(userIdFetch.value);
-    }
-  })();
-  </script>
 </body>
 </html>
