@@ -1,0 +1,8 @@
+{
+  "name": "fintrack-risk-mahesh",
+  "version": "1.0.6",
+  "description": "Rule-based risk scoring library for FinTrack",
+  "main": "index.js",
+  "author": "Mahesh Purre",
+  "license": "MIT"
+}
