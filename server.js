@@ -1,39 +1,56 @@
 // server.js
+// FinTrack backend (local-file CSV upload variant - Option B)
+//
+// Features:
+// - Express API for auth, transactions, uploads
+// - CSV uploads saved to local /tmp/uploads (ephemeral) and enqueued as jobs
+// - Worker loop picks up parse_csv and rescore_all jobs
+// - Uses multer memory storage so req.file.buffer is available
+// - Serves frontend from ./frontend if present
+//
+// WARNING: Uploaded files are stored on the instance ephemeral storage (/tmp/uploads).
+// If the EB instance is replaced, files are lost. This is intended for quick testing/dev.
+
 require('dotenv').config();
 
 const express = require('express');
 const path = require('path');
+const fs = require('fs');
 const multer = require('multer');
-const csv = require('csv-parser');
-const cloudinary = require('cloudinary').v2;
+const csv = require('csv-parser'); // npm install csv-parser
 const { v4: uuidv4 } = require('uuid');
 
-const db = require('./db'); // your DB helper
+const db = require('./db'); // your DB helper (expects db.query)
 const { RiskEstimator } = require('./fintrack-risk-lib'); // your risk scoring lib
 
-// ----------------- configuration & setup -----------------
+// ---------- configuration ----------
 const PORT = process.env.PORT || 8000;
+const UPLOAD_DIR = process.env.UPLOAD_DIR || '/tmp/uploads';
+fs.mkdirSync(UPLOAD_DIR, { recursive: true, mode: 0o700 });
+
+// ---------- app & middleware ----------
 const app = express();
 app.use(express.json());
 
-// Multer - use memory storage so we can stream Buffer to cloudinary
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 } // 50 MB
-});
+// multer memory storage
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
-// Cloudinary config (read from env)
-cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME || '',
-  api_key: process.env.CLOUDINARY_API_KEY || '',
-  api_secret: process.env.CLOUDINARY_API_SECRET || ''
-});
-const CLOUDINARY_OK = !!(process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET);
-
-// Risk estimator instance
 const estimator = new RiskEstimator();
 
-// ----------------- DB initialization -----------------
+// ---------- helpers ----------
+function safeParseNumber(v) {
+  if (v === null || v === undefined) return 0;
+  const s = String(v).replace(/[^0-9.-]+/g, '');
+  const n = Number(s);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function isLikelyUserId(id) {
+  if (!id || typeof id !== 'string') return false;
+  return /^[A-Za-z0-9\-_]{8,}$/.test(id);
+}
+
+// ---------- DB tables init ----------
 async function initTables() {
   try {
     await db.query(`
@@ -60,30 +77,16 @@ async function initTables() {
         status TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )`);
-    console.log('DB tables initialized');
+    console.log('DB tables ensured');
   } catch (e) {
     console.error('initTables error', e && e.message ? e.message : e);
     throw e;
   }
 }
 
-// ----------------- helper utilities -----------------
-function safeParseNumber(v) {
-  if (v === null || v === undefined) return 0;
-  const s = String(v).replace(/[^0-9.-]+/g, '');
-  const n = Number(s);
-  return Number.isFinite(n) ? n : 0;
-}
+// ---------- API routes ----------
 
-function isLikelyUserId(id) {
-  if (!id || typeof id !== 'string') return false;
-  // loose check: at least 8 alnum/ - _ chars
-  return /^[A-Za-z0-9\-_]{8,}$/.test(id);
-}
-
-// ----------------- API routes -----------------
-
-// Simple auth/register echo
+// auth/register echo
 app.post('/api/auth/echo', async (req, res) => {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'email required' });
@@ -99,14 +102,13 @@ app.post('/api/auth/echo', async (req, res) => {
   }
 });
 
-// Create transaction
+// create single transaction
 app.post('/api/transactions', async (req, res) => {
   try {
     const body = req.body || {};
     if (!body.user_id) return res.status(400).json({ error: 'user_id required' });
 
     const amount = safeParseNumber(body.amount ?? body.amountString ?? 0);
-
     const tx = {
       user_id: body.user_id,
       amount,
@@ -130,7 +132,7 @@ app.post('/api/transactions', async (req, res) => {
   }
 });
 
-// List transactions for a user
+// list transactions for a user
 app.get('/api/transactions', async (req, res) => {
   try {
     const user_id = req.query.user_id;
@@ -143,49 +145,31 @@ app.get('/api/transactions', async (req, res) => {
   }
 });
 
-// Upload CSV endpoint
-// - expects multipart form field 'file' and form field 'user_id'
+// Upload CSV -> save to local disk and enqueue job
 app.post('/api/transactions/upload', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'file required' });
-
     const user_id = (req.body.user_id || '').trim();
     if (!user_id) return res.status(400).json({ error: 'user_id required' });
     if (!isLikelyUserId(user_id)) return res.status(400).json({ error: 'user_id appears invalid' });
 
-    if (!CLOUDINARY_OK) {
-      // If you want to save locally instead, implement local disk storage here.
-      return res.status(500).json({ error: 'upload failed', details: 'Cloudinary not configured. Set CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET / CLOUDINARY_CLOUD_NAME' });
-    }
+    const filename = `${Date.now()}-${Math.random().toString(36).slice(2,8)}.csv`;
+    const fullpath = path.join(UPLOAD_DIR, filename);
 
-    // stream buffer to Cloudinary (raw resource type)
-    const streamUpload = (buffer) => new Promise((resolve, reject) => {
-      const stream = cloudinary.uploader.upload_stream({ resource_type: 'raw', folder: 'fintrack_uploads' }, (error, result) => {
-        if (result) resolve(result);
-        else reject(error || new Error('cloudinary upload failed'));
-      });
-      stream.end(buffer);
-    });
+    fs.writeFileSync(fullpath, req.file.buffer, { mode: 0o600 });
 
-    const result = await streamUpload(req.file.buffer);
-    if (!result || !result.secure_url) {
-      console.error('cloudinary upload returned unexpected result', result);
-      return res.status(500).json({ error: 'upload failed', details: 'cloudinary upload did not return a URL' });
-    }
-
-    // enqueue job to parse CSV from the uploaded URL
     const jobId = uuidv4();
-    const payload = { user_id, url: result.secure_url };
+    const payload = { user_id, local_path: fullpath };
     await db.query('INSERT INTO jobs(id,type,payload,status) VALUES($1,$2,$3,$4)', [jobId, 'parse_csv', payload, 'pending']);
 
-    return res.json({ uploaded: true, url: result.secure_url, job_id: jobId });
+    return res.json({ uploaded: true, path: fullpath, job_id: jobId });
   } catch (e) {
     console.error('/api/transactions/upload error', e && e.message ? e.message : e);
     return res.status(500).json({ error: 'upload failed', details: (e && e.message) || String(e) });
   }
 });
 
-// Trigger rescore job
+// trigger rescore job
 app.post('/api/rescore', async (req, res) => {
   try {
     const { user_id } = req.body || {};
@@ -200,7 +184,7 @@ app.post('/api/rescore', async (req, res) => {
   }
 });
 
-// Dashboard summary
+// simple dashboard
 app.get('/api/dashboard', async (req, res) => {
   try {
     const user_id = req.query.user_id;
@@ -220,36 +204,34 @@ app.get('/api/dashboard', async (req, res) => {
   }
 });
 
-// Serve static UI (if present)
+// serve frontend static if exists
 app.use(express.static(path.join(__dirname, 'frontend')));
 
-// ----------------- Worker loop to process jobs -----------------
+// ---------- Worker loop & job processors ----------
+
 async function processParseCsvJob(job) {
   try {
     const payload = job.payload || {};
     const user_id = payload.user_id;
-    const url = payload.url;
-    if (!user_id || !url) {
-      console.warn('parse_csv job missing user_id or url', job.id);
+    const local_path = payload.local_path;
+    if (!user_id || !local_path) {
+      console.warn('parse_csv job missing fields', job.id);
       await db.query('UPDATE jobs SET status=$1 WHERE id=$2', ['failed', job.id]);
       return;
     }
 
-    console.log(`Processing CSV for job=${job.id} user=${user_id} url=${url}`);
+    console.log(`Processing CSV job=${job.id} user=${user_id} path=${local_path}`);
 
-    // Fetch the CSV file (Node 18+ global fetch)
-    const resp = await fetch(url);
-    if (!resp.ok) {
-      console.error('Failed to fetch CSV url', url, 'status', resp.status);
+    if (!fs.existsSync(local_path)) {
+      console.error('CSV file not found:', local_path);
       await db.query('UPDATE jobs SET status=$1 WHERE id=$2', ['failed', job.id]);
       return;
     }
 
-    // stream parse and insert rows
-    const stream = resp.body.pipe(csv({ mapHeaders: ({ header }) => header.trim() }));
-
+    const rs = fs.createReadStream(local_path).pipe(csv({ mapHeaders: ({ header }) => header.trim() }));
     let inserted = 0;
-    for await (const row of stream) {
+
+    for await (const row of rs) {
       try {
         const tx = {
           user_id,
@@ -258,21 +240,26 @@ async function processParseCsvJob(job) {
           merchant: row.merchant ?? row.Merchant ?? 'unknown',
           timestamp: row.timestamp ?? row.Timestamp ?? new Date().toISOString()
         };
+
         const id = uuidv4();
         const score = estimator.scoreTransaction(tx);
+
         await db.query(
           `INSERT INTO transactions(id,user_id,amount,country,merchant,timestamp,risk_score) VALUES($1,$2,$3,$4,$5,$6,$7)`,
           [id, tx.user_id, tx.amount, tx.country, tx.merchant, tx.timestamp, score]
         );
         inserted++;
       } catch (innerErr) {
-        console.error('Error inserting row from CSV', innerErr && innerErr.message ? innerErr.message : innerErr);
+        console.error('Error inserting CSV row', innerErr && innerErr.message ? innerErr.message : innerErr);
         // continue processing other rows
       }
     }
 
+    // optionally delete uploaded file after processing
+    try { fs.unlinkSync(local_path); } catch (e) { /* ignore */ }
+
     await db.query('UPDATE jobs SET status=$1 WHERE id=$2', ['done', job.id]);
-    console.log(`CSV job ${job.id} complete - inserted ${inserted} rows`);
+    console.log(`CSV job ${job.id} done - inserted ${inserted} rows`);
   } catch (err) {
     console.error('processParseCsvJob error', err && err.message ? err.message : err);
     try { await db.query('UPDATE jobs SET status=$1 WHERE id=$2', ['failed', job.id]); } catch (e) {}
@@ -308,30 +295,42 @@ async function workerLoop() {
       const r = await db.query("SELECT * FROM jobs WHERE status='pending' ORDER BY created_at LIMIT 5");
       for (const job of r.rows) {
         await db.query('UPDATE jobs SET status=$1 WHERE id=$2', ['processing', job.id]);
-        if (job.type === 'parse_csv') {
-          await processParseCsvJob(job);
-        } else if (job.type === 'rescore_all') {
-          await processRescoreJob(job);
-        } else {
-          console.warn('Unknown job type', job.type);
+        try {
+          if (job.type === 'parse_csv') {
+            await processParseCsvJob(job);
+          } else if (job.type === 'rescore_all') {
+            await processRescoreJob(job);
+          } else {
+            console.warn('Unknown job type', job.type);
+            await db.query('UPDATE jobs SET status=$1 WHERE id=$2', ['failed', job.id]);
+          }
+        } catch (jobErr) {
+          console.error('job processing error', jobErr && jobErr.message ? jobErr.message : jobErr);
           await db.query('UPDATE jobs SET status=$1 WHERE id=$2', ['failed', job.id]);
         }
       }
     } catch (e) {
-      console.error('workerLoop error', e && e.message ? e.message : e);
+      console.error('worker loop error', e && e.message ? e.message : e);
     }
+    // small sleep
     await new Promise(r => setTimeout(r, 3000));
   }
 }
 
-// ----------------- Start server & worker -----------------
+// ---------- error handler ----------
+app.use((err, req, res, next) => {
+  console.error('Unhandled error', err && err.stack ? err.stack : err);
+  res.status(err.status || 500).json({ error: err.message || 'Server error' });
+});
+
+// ---------- start server ----------
 initTables()
   .then(() => {
-    // run worker async (do not block server)
-    workerLoop().catch(err => console.error('workerLoop failed', err && err.message ? err.message : err));
-    app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+    // start worker in background
+    workerLoop().catch(e => console.error('worker failed', e && e.message ? e.message : e));
+    app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
   })
   .catch(e => {
-    console.error('Failed to initialize DB tables', e && e.message ? e.message : e);
+    console.error('initTables failed', e && e.message ? e.message : e);
     process.exit(1);
   });
