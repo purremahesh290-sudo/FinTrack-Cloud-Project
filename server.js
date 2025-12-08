@@ -1,59 +1,60 @@
 // server.js
-// FinTrack backend (local-file CSV upload variant - flexible header mapping)
-//
-// Features:
-// - Express API for auth, transactions, uploads
-// - CSV uploads saved to local /tmp/uploads (ephemeral) and enqueued as jobs
-// - Worker loop picks up parse_csv and rescore_all jobs
-// - CSV parser normalises headers and accepts common synonyms for amount, merchant, country, timestamp
-// - Multer memory storage used so req.file.buffer is available
-// - Serves frontend from ./frontend if present
-//
-// WARNING: Uploaded files are stored on instance ephemeral storage (/tmp/uploads).
-// If the EB instance is replaced, files are lost. Good for testing/demo.
+// Full backend for FinTrack — local uploads (no Cloudinary).
+// Expects env: DATABASE_URL, PORT (optional), S3_BUCKET (optional but unused here)
 
 require('dotenv').config();
-
 const express = require('express');
-const path = require('path');
 const fs = require('fs');
+const path = require('path');
 const multer = require('multer');
-const csv = require('csv-parser'); // npm install csv-parser
+const { parse } = require('csv-parse/sync'); // sync parser (small files). Install: npm i csv-parse
 const { v4: uuidv4 } = require('uuid');
 
-const db = require('./db'); // your DB helper (expects db.query)
-const { RiskEstimator } = require('./fintrack-risk-lib'); // your risk scoring lib
+const db = require('./db'); // your existing DB helper (pg wrapper)
+const { RiskEstimator } = require('./fintrack-risk-lib'); // your risk logic
 
-// ---------- configuration ----------
-const PORT = process.env.PORT || 8000;
-const UPLOAD_DIR = process.env.UPLOAD_DIR || '/tmp/uploads';
-fs.mkdirSync(UPLOAD_DIR, { recursive: true, mode: 0o700 });
-
-// ---------- app & middleware ----------
 const app = express();
 app.use(express.json());
 
-// multer memory storage (keeps file in req.file.buffer)
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
+// Upload configuration: store uploaded files into /tmp/uploads
+const UPLOAD_DIR = path.join('/tmp', 'uploads');
+try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch (e) { /* ignore */ }
+const storage = multer.memoryStorage();
+const upload = multer({ storage });
 
-const estimator = new RiskEstimator();
-
-// ---------- helpers ----------
-function safeParseNumber(v) {
-  if (v === null || v === undefined) return 0;
-  // remove currency symbols and thousands separators, keep - and .
-  const s = String(v).replace(/[^0-9\.\-]+/g, '');
+// helpers
+function safeParseNumber(input) {
+  if (input === null || input === undefined) return 0;
+  // remove currency symbols, commas, whitespace
+  const s = String(input).replace(/[^\d.\-]/g, '').trim();
   const n = Number(s);
   return Number.isFinite(n) ? n : 0;
 }
 
-function isLikelyUserId(id) {
-  if (!id || typeof id !== 'string') return false;
-  // simple UUID-ish check (loose)
-  return /^[0-9a-fA-F\-]{8,}$/i.test(id);
+function normalizeHeader(h) {
+  if (!h) return '';
+  // strip BOM
+  let s = String(h).replace(/^\uFEFF/, '');
+  // remove parentheses and quotes, replace non-word (except - and _) with space
+  s = s.replace(/[()\[\]"]/g, '').replace(/[^\w\s\-]/g, ' ');
+  // collapse whitespace, lowercase
+  s = s.replace(/\s+/g, ' ').trim().toLowerCase();
+  return s;
 }
 
-// ---------- DB tables init ----------
+function pickByTokens(tokens, row) {
+  for (const [k, v] of Object.entries(row)) {
+    if (!k) continue;
+    for (const t of tokens) {
+      if (k.includes(t) && String(v || '').trim() !== '') return String(v).trim();
+    }
+  }
+  return null;
+}
+
+const estimator = new RiskEstimator();
+
+// ------------------ DB init ------------------
 async function initTables() {
   try {
     await db.query(`
@@ -80,16 +81,16 @@ async function initTables() {
         status TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )`);
-    console.log('DB tables ensured');
+    console.log('Tables checked/created');
   } catch (e) {
     console.error('initTables error', e && e.message ? e.message : e);
     throw e;
   }
 }
 
-// ---------- API routes ----------
+// ------------------ API Endpoints ------------------
 
-// auth/register echo
+// auth echo (simple)
 app.post('/api/auth/echo', async (req, res) => {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'email required' });
@@ -100,18 +101,20 @@ app.post('/api/auth/echo', async (req, res) => {
     await db.query('INSERT INTO users(id,email) VALUES($1,$2)', [id, email]);
     res.json({ id, email });
   } catch (e) {
-    console.error('/api/auth/echo error', e && e.message ? e.message : e);
+    console.error('auth error', e);
     res.status(500).json({ error: 'server error' });
   }
 });
 
-// create single transaction
+// create single transaction via API
 app.post('/api/transactions', async (req, res) => {
   try {
     const body = req.body || {};
     if (!body.user_id) return res.status(400).json({ error: 'user_id required' });
 
-    const amount = safeParseNumber(body.amount ?? body.amountString ?? 0);
+    const rawAmount = body.amount ?? body.amountString ?? "0";
+    const amount = safeParseNumber(rawAmount);
+
     const tx = {
       user_id: body.user_id,
       amount,
@@ -130,7 +133,7 @@ app.post('/api/transactions', async (req, res) => {
 
     res.json({ id, risk_score: score });
   } catch (e) {
-    console.error('/api/transactions error', e && e.message ? e.message : e);
+    console.error('/api/transactions error', e);
     res.status(500).json({ error: 'server error' });
   }
 });
@@ -143,32 +146,30 @@ app.get('/api/transactions', async (req, res) => {
     const r = await db.query('SELECT * FROM transactions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1000', [user_id]);
     res.json(r.rows);
   } catch (e) {
-    console.error('/api/transactions GET error', e && e.message ? e.message : e);
+    console.error('/api/transactions GET error', e);
     res.status(500).json({ error: 'server error' });
   }
 });
 
-// Upload CSV -> save to local disk and enqueue job
+// upload CSV (local store) -> create parse_csv job
 app.post('/api/transactions/upload', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'file required' });
-    const user_id = (req.body.user_id || '').trim();
+    const user_id = req.body.user_id;
     if (!user_id) return res.status(400).json({ error: 'user_id required' });
-    if (!isLikelyUserId(user_id)) return res.status(400).json({ error: 'user_id appears invalid' });
 
-    const filename = `${Date.now()}-${Math.random().toString(36).slice(2,8)}.csv`;
-    const fullpath = path.join(UPLOAD_DIR, filename);
-
-    fs.writeFileSync(fullpath, req.file.buffer, { mode: 0o600 });
+    const fname = `${Date.now()}-${Math.random().toString(36).slice(2,9)}.csv`;
+    const localPath = path.join(UPLOAD_DIR, fname);
+    fs.writeFileSync(localPath, req.file.buffer);
 
     const jobId = uuidv4();
-    const payload = { user_id, local_path: fullpath };
+    const payload = { user_id, local_path: localPath };
     await db.query('INSERT INTO jobs(id,type,payload,status) VALUES($1,$2,$3,$4)', [jobId, 'parse_csv', payload, 'pending']);
-
-    return res.json({ uploaded: true, path: fullpath, job_id: jobId });
+    console.log('Uploaded CSV saved to', localPath, 'job=', jobId);
+    res.json({ uploaded: true, path: localPath, job_id: jobId });
   } catch (e) {
     console.error('/api/transactions/upload error', e && e.message ? e.message : e);
-    return res.status(500).json({ error: 'upload failed', details: (e && e.message) || String(e) });
+    res.status(500).json({ error: 'upload failed', details: e && e.message ? e.message : String(e) });
   }
 });
 
@@ -182,35 +183,35 @@ app.post('/api/rescore', async (req, res) => {
     await db.query('INSERT INTO jobs(id,type,payload,status) VALUES($1,$2,$3,$4)', [jobId, 'rescore_all', payload, 'pending']);
     res.json({ job_id: jobId });
   } catch (e) {
-    console.error('/api/rescore error', e && e.message ? e.message : e);
+    console.error('/api/rescore error', e);
     res.status(500).json({ error: 'server error' });
   }
 });
 
-// simple dashboard
+// dashboard aggregate
 app.get('/api/dashboard', async (req, res) => {
   try {
     const user_id = req.query.user_id;
     if (!user_id) return res.status(400).json({ error: 'user_id required' });
     const r = await db.query('SELECT * FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1000', [user_id]);
     const txs = r.rows;
-    const total = txs.reduce((s, t) => s + Number(t.amount || 0), 0);
+    const total = txs.reduce((s,t)=> s + Number(t.amount || 0), 0);
     const byMonth = {};
     for (const t of txs) {
-      const month = (new Date(t.timestamp)).toISOString().slice(0, 7);
+      const month = (new Date(t.timestamp)).toISOString().slice(0,7);
       byMonth[month] = (byMonth[month] || 0) + Number(t.amount || 0);
     }
     res.json({ count: txs.length, total, byMonth });
   } catch (e) {
-    console.error('/api/dashboard error', e && e.message ? e.message : e);
+    console.error('/api/dashboard error', e);
     res.status(500).json({ error: 'server error' });
   }
 });
 
-// serve frontend static if exists
+// serve frontend static (if present)
 app.use(express.static(path.join(__dirname, 'frontend')));
 
-// ---------- Worker loop & job processors ----------
+// ------------------ Worker: process jobs ------------------
 
 async function processParseCsvJob(job) {
   try {
@@ -231,73 +232,47 @@ async function processParseCsvJob(job) {
       return;
     }
 
-    const rs = fs.createReadStream(local_path).pipe(csv({ mapHeaders: ({ header }) => header }));
+    const buf = fs.readFileSync(local_path);
+    const text = buf.toString('utf8');
+
+    // parse into records with normalized headers
+    const records = parse(text, {
+      columns: (header) => header.map(normalizeHeader),
+      skip_empty_lines: true,
+      relax_column_count: true,
+      trim: true
+    });
+
+    console.log(`CSV job ${job.id}: parsed ${records.length} rows`);
+    if (records.length > 0) {
+      console.log('CSV job header keys (normalized):', Object.keys(records[0]).join(', '));
+    }
+
     let inserted = 0;
 
-    // Flexible header mapping loop:
-    for await (const rowRaw of rs) {
-      try {
-        // Normalize keys: trim + lowercase
-        const row = {};
-        for (const [k, v] of Object.entries(rowRaw || {})) {
-          const nk = String(k || '').trim().toLowerCase();
-          row[nk] = v;
-        }
+    // token lists for fuzzy matching
+    const amountTokens = ['amount','amt','value','price','debit','credit','transaction_amount','amount_eur','amount_euro'];
+    const merchantTokens = ['merchant','shop','payee','vendor','store','description','narrative','merchant_name'];
+    const countryTokens = ['country','location','country_code','countryname','country_name'];
+    const dateTokens = ['timestamp','date','datetime','transaction_date','posted_date','created_at','time'];
 
-        // amount candidates
-        const amountCandidates = [
-          'amount', 'amt', 'value', 'amount (eur)', 'amount_eur',
-          'transaction_amount', 'debit', 'credit', 'money', 'amount_euro', 'price'
-        ];
-        let rawAmount = 0;
-        for (const c of amountCandidates) {
-          if (row[c] !== undefined && String(row[c]).trim() !== '') {
-            rawAmount = row[c];
-            break;
-          }
-        }
+    for (const row of records) {
+      try {
+        // pick fields by token matching
+        const rawAmount = pickByTokens(amountTokens, row) ?? 0;
         const amount = safeParseNumber(rawAmount);
 
-        // merchant candidates
-        const merchantCandidates = ['merchant', 'shop', 'payee', 'description', 'vendor', 'store', 'narrative'];
-        let merchant = 'unknown';
-        for (const c of merchantCandidates) {
-          if (row[c] !== undefined && String(row[c]).trim() !== '') {
-            merchant = String(row[c]).trim();
-            break;
-          }
-        }
+        const merchant = pickByTokens(merchantTokens, row) || 'unknown';
+        const country = pickByTokens(countryTokens, row) || 'Ireland';
 
-        // country candidates
-        const countryCandidates = ['country', 'country_code', 'location', 'countryname'];
-        let country = 'Ireland';
-        for (const c of countryCandidates) {
-          if (row[c] !== undefined && String(row[c]).trim() !== '') {
-            country = String(row[c]).trim();
-            break;
-          }
-        }
-
-        // date / timestamp candidates
-        const dateCandidates = ['timestamp', 'date', 'datetime', 'transaction_date', 'posted_date', 'created_at'];
         let timestamp = new Date().toISOString();
-        for (const c of dateCandidates) {
-          if (row[c] !== undefined && String(row[c]).trim() !== '') {
-            const s = String(row[c]).trim();
-            const parsed = new Date(s);
-            timestamp = isNaN(parsed.getTime()) ? s : parsed.toISOString();
-            break;
-          }
+        const rawTimestamp = pickByTokens(dateTokens, row);
+        if (rawTimestamp) {
+          const p = new Date(rawTimestamp);
+          timestamp = isNaN(p.getTime()) ? rawTimestamp : p.toISOString();
         }
 
-        const tx = {
-          user_id,
-          amount,
-          country,
-          merchant,
-          timestamp
-        };
-
+        const tx = { user_id, amount, country, merchant, timestamp };
         const id = uuidv4();
         const score = estimator.scoreTransaction(tx);
 
@@ -308,12 +283,11 @@ async function processParseCsvJob(job) {
         inserted++;
       } catch (innerErr) {
         console.error('Error inserting CSV row', innerErr && innerErr.message ? innerErr.message : innerErr);
-        // continue processing other rows
       }
     }
 
-    // optionally delete uploaded file after processing
-    try { fs.unlinkSync(local_path); } catch (e) { /* ignore */ }
+    // cleanup local file (ignore errors)
+    try { fs.unlinkSync(local_path); } catch (e) {}
 
     await db.query('UPDATE jobs SET status=$1 WHERE id=$2', ['done', job.id]);
     console.log(`CSV job ${job.id} done - inserted ${inserted} rows`);
@@ -325,23 +299,23 @@ async function processParseCsvJob(job) {
 
 async function processRescoreJob(job) {
   try {
-    const payload = job.payload || {};
-    const user_id = payload.user_id;
+    const user_id = job.payload && job.payload.user_id;
     if (!user_id) {
-      console.warn('rescore job missing user_id', job.id);
+      console.warn('rescore_all job missing user_id', job.id);
       await db.query('UPDATE jobs SET status=$1 WHERE id=$2', ['failed', job.id]);
       return;
     }
-    const r = await db.query('SELECT id,amount,country,merchant,timestamp FROM transactions WHERE user_id=$1', [user_id]);
-    for (const t of r.rows) {
+    console.log(`Processing rescore job=${job.id} user=${user_id}`);
+    const txs = await db.query('SELECT id,amount,country,merchant,timestamp FROM transactions WHERE user_id=$1', [user_id]);
+    for (const t of txs.rows) {
       const score = estimator.scoreTransaction(t);
       await db.query('UPDATE transactions SET risk_score=$1 WHERE id=$2', [score, t.id]);
     }
     await db.query('UPDATE jobs SET status=$1 WHERE id=$2', ['done', job.id]);
-    console.log(`Rescore job ${job.id} done for user ${user_id}`);
+    console.log(`Rescore job ${job.id} done - updated ${txs.rowCount} rows`);
   } catch (e) {
     console.error('processRescoreJob error', e && e.message ? e.message : e);
-    try { await db.query('UPDATE jobs SET status=$1 WHERE id=$2', ['failed', job.id]); } catch (er) {}
+    try { await db.query('UPDATE jobs SET status=$1 WHERE id=$2', ['failed', job.id]); } catch (e) {}
   }
 }
 
@@ -349,9 +323,10 @@ async function workerLoop() {
   console.log('Worker started, polling for jobs...');
   while (true) {
     try {
-      const r = await db.query("SELECT * FROM jobs WHERE status='pending' ORDER BY created_at LIMIT 5");
+      const r = await db.query("SELECT * FROM jobs WHERE status='pending' ORDER BY created_at LIMIT 10");
       for (const job of r.rows) {
-        await db.query('UPDATE jobs SET status=$1 WHERE id=$2', ['processing', job.id]);
+        const id = job.id;
+        await db.query('UPDATE jobs SET status=$1 WHERE id=$2', ['processing', id]);
         try {
           if (job.type === 'parse_csv') {
             await processParseCsvJob(job);
@@ -359,35 +334,31 @@ async function workerLoop() {
             await processRescoreJob(job);
           } else {
             console.warn('Unknown job type', job.type);
-            await db.query('UPDATE jobs SET status=$1 WHERE id=$2', ['failed', job.id]);
+            await db.query('UPDATE jobs SET status=$1 WHERE id=$2', ['failed', id]);
           }
         } catch (jobErr) {
           console.error('job processing error', jobErr && jobErr.message ? jobErr.message : jobErr);
-          await db.query('UPDATE jobs SET status=$1 WHERE id=$2', ['failed', job.id]);
+          await db.query('UPDATE jobs SET status=$1 WHERE id=$2', ['failed', id]);
         }
       }
     } catch (e) {
       console.error('worker loop error', e && e.message ? e.message : e);
     }
-    // small sleep
+    // sleep 3s (short)
     await new Promise(r => setTimeout(r, 3000));
   }
 }
 
-// ---------- error handler ----------
-app.use((err, req, res, next) => {
-  console.error('Unhandled error', err && err.stack ? err.stack : err);
-  res.status(err.status || 500).json({ error: err.message || 'Server error' });
+// ------------------ start ------------------
+const PORT = process.env.PORT || 8000;
+initTables().then(() => {
+  // start worker
+  workerLoop().catch(e => console.error('worker failed', e));
+  app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+}).catch(e => {
+  console.error('initTables failed', e);
+  process.exit(1);
 });
 
-// ---------- start server ----------
-initTables()
-  .then(() => {
-    // start worker in background
-    workerLoop().catch(e => console.error('worker failed', e && e.message ? e.message : e));
-    app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
-  })
-  .catch(e => {
-    console.error('initTables failed', e && e.message ? e.message : e);
-    process.exit(1);
-  });
+// export for tests
+module.exports = app;
