@@ -1,0 +1,4 @@
+Retrieving logs...
+Logs were saved to /workspaces/FinTrack-Cloud-Project/.elasticbeanstalk/logs/251208_164437
+Logs were saved to /workspaces/FinTrack-Cloud-Project/.elasticbeanstalk/logs/251208_164437
+Updated symlink at /workspaces/FinTrack-Cloud-Project/.elasticbeanstalk/logs/latest
